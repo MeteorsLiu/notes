@@ -78,6 +78,14 @@ func add$gowrapper(ptr *unsafe.Pointer) {
 
 这是 TinyGo "复杂度从运行时转移到编译时" 的典型体现。
 
+## 执行流
+```
+scheduler → swapTask → tinygo_startTask → wrapper → 用户函数
+                              ↑                          ↓
+                              └────── tinygo_task_exit ──┘
+                                      (调用 Pause)
+```
+
 ## 栈初始化
 
 ### 内存布局
@@ -129,12 +137,22 @@ func (s *state) archInit(r *calleeSavedRegs, fn uintptr, args unsafe.Pointer) {
 
 ## 上下文切换
 
-执行流：
-```
-scheduler → swapTask → tinygo_startTask → wrapper → 用户函数
-                              ↑                          ↓
-                              └────── tinygo_task_exit ──┘
-                                      (调用 Pause)
+上下文：
+```go
+// calleeSavedRegs is the list of registers that must be saved and restored when
+// switching between tasks. Also see task_stack_386.S that relies on the exact
+// layout of this struct.
+type calleeSavedRegs struct {
+	ebx uintptr
+	esi uintptr
+	edi uintptr
+	ebp uintptr
+
+	pc uintptr
+
+	// Pad this struct so that tasks start on a 16-byte aligned stack.
+	_ [3]uintptr
+}
 ```
 
 ### swapTask 实现
