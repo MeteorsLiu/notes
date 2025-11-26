@@ -79,6 +79,15 @@ func add$gowrapper(ptr *unsafe.Pointer) {
 这是 TinyGo "复杂度从运行时转移到编译时" 的典型体现。
 
 ## 执行流
+### 初始化
+```
+wrapper → task.start → tinygo_startTask → scheduler
+                             ↑                 ↓
+                             └tinygo_task_exit ┘
+```
+
+
+### 上下文切换
 ```
 scheduler → swapTask → tinygo_startTask → wrapper → 用户函数
                               ↑                          ↓
