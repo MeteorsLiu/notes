@@ -45,191 +45,6 @@ go funcVar(a, b, c int)            // 函数指针
 go func() { println(captured) }()  // 闭包
 ```
 
-**Wrapper 是编译时生成的适配层**，统一转换为 `func(*unsafe.Pointer)`。
-
-#### 场景 1：普通函数
-
-`compiler/goroutine.go:289`
-
-```go
-func add(x, y int) int { return x + y }
-go add(10, 20)
-
-// 编译器生成
-func add$gowrapper(ptr *unsafe.Pointer) {
-    args := (*struct{x, y int64})(ptr)
-    add(args.x, args.y)  // 忽略返回值
-}
-```
-
-LLVM IR：
-```llvm
-define void @add$gowrapper(i8* %args) {
-  %0 = bitcast i8* %args to {i64, i64}*
-  %x = extractvalue {i64, i64}* %0, 0
-  %y = extractvalue {i64, i64}* %0, 1
-  call void @add(i64 %x, i64 %y, i8* undef)  ; context=undef
-  ret void
-}
-```
-
-#### 场景 2：方法调用
-
-```go
-type Obj struct { val int }
-func (o *Obj) Inc() { o.val++ }
-
-obj := &Obj{val: 5}
-go obj.Inc()
-
-// 参数包：包含接收者
-struct params { receiver *Obj }
-
-func (*Obj).Inc$gowrapper(ptr *unsafe.Pointer) {
-    args := (*struct{receiver *Obj})(ptr)
-    args.receiver.Inc()
-}
-```
-
-#### 场景 3：闭包
-
-`compiler/goroutine.go:71-77`
-
-```go
-x := 10
-go func() { println(x) }()
-
-// 编译器处理
-closure := makeClosure(fn: &anon_func, context: &struct{x int}{10})
-
-// 参数包
-struct params { context *struct{x int} }
-
-func anon$gowrapper(ptr *unsafe.Pointer) {
-    args := (*struct{context *struct{x int}})(ptr)
-    anon_func(args.context)  // 传入捕获的变量
-}
-```
-
-#### 场景 4：函数指针（最复杂）
-
-`compiler/goroutine.go:454-521`
-
-```go
-var fn func(int, int) int
-fn = add
-go fn(10, 20)  // 编译时不知道调用哪个函数
-
-// 双重打包：参数 + 函数指针
-struct params {
-    int64 x, y
-    context *void
-    fn_ptr  uintptr  // 运行时确定
-}
-
-// 通用 wrapper（按签名生成）
-func "func(int,int)int"$gowrapper(ptr *unsafe.Pointer) {
-    args := (*struct{x, y int64, ctx, fn uintptr})(ptr)
-    fn := (*func(int64, int64, *void) int)(args.fn)
-    fn(args.x, args.y, args.ctx)  // 间接调用
-}
-```
-
-代码实现：
-```go
-// 454 行：参数包包含函数指针本身
-paramTypes = append(paramTypes, fn.Type())
-params := b.emitPointerUnpack(wrapper.Param(0), paramTypes)
-
-// 取出函数指针（最后一个元素）
-fnPtr := params[len(params)-1]
-params = params[:len(params)-1]
-
-// 间接调用
-b.CreateCall(fnType, fnPtr, params, "")
-```
-
-#### Context 参数处理
-
-TinyGo 所有函数都有隐藏的 context 参数：
-```go
-func add(x, y int, context *void) int
-```
-
-用途：
-- 存储 goroutine-local 数据（defer 栈等）
-- 传递闭包捕获的变量
-
-Wrapper 处理：
-```go
-// compiler/goroutine.go:358
-if !hasContext {
-    params = append(params, llvm.Undef(c.dataPtrType))  // 传 undef
-}
-```
-
-- 普通函数：context = undef（优化器消除）
-- 闭包：context = 捕获变量指针
-
-#### 优化策略
-
-**1. Wrapper 合并**
-
-`compiler/goroutine.go:320-321`
-
-```go
-wrapper.SetLinkage(llvm.LinkOnceODRLinkage)  // 允许合并
-wrapper.SetUnnamedAddr(true)                  // 地址无关
-```
-
-相同签名的 wrapper 在链接时合并：
-```go
-go add(1, 2)
-go sub(3, 4)  // 签名相同 → 复用 add$gowrapper
-```
-
-**2. 内联消除**
-
-Wrapper 通常被内联，解包开销接近零：
-```llvm
-; 优化前
-call @task.start(@add$gowrapper, %params, 2048)
-
-; 优化后
-%x = load %params.x
-%y = load %params.y
-call @add(%x, %y)
-```
-
-**3. 标记属性**
-
-```go
-wrapper.AddAttributeAtIndex(-1, c.ctx.CreateStringAttribute("tinygo-gowrapper", name))
-```
-
-后续编译 pass 可识别并特殊处理（如栈大小分析）。
-
-#### 为什么不用运行时反射？
-
-对比标准 Go 的反射方案：
-
-```go
-// 反射方案（标准 Go）
-func tinygo_startTask(fn interface{}, args []interface{}) {
-    fnVal := reflect.ValueOf(fn)
-    argVals := make([]reflect.Value, len(args))
-    for i, arg := range args {
-        argVals[i] = reflect.ValueOf(arg)
-    }
-    fnVal.Call(argVals)  // 运行时类型检查
-}
-```
-
-问题：
-- 需要完整 reflect 包（~50KB）
-- 运行时类型检查开销
-- 嵌入式环境不可接受
-
 TinyGo 方案：
 ```go
 // 编译时生成
@@ -314,6 +129,14 @@ func (s *state) archInit(r *calleeSavedRegs, fn uintptr, args unsafe.Pointer) {
 
 ## 上下文切换
 
+执行流：
+```
+scheduler → swapTask → tinygo_startTask → wrapper → 用户函数
+                              ↑                          ↓
+                              └────── tinygo_task_exit ──┘
+                                      (调用 Pause)
+```
+
 ### swapTask 实现
 
 `src/internal/task/task_stack_amd64.S:45`
@@ -346,14 +169,6 @@ tinygo_startTask:
     movq %r13, %rdi       # args → 第一参数
     callq *%r12           # 调用 wrapper
     jmp tinygo_task_exit  # 自动退出
-```
-
-执行流：
-```
-scheduler → swapTask → tinygo_startTask → wrapper → 用户函数
-                              ↑                          ↓
-                              └────── tinygo_task_exit ──┘
-                                      (调用 Pause)
 ```
 
 ## 调度器
@@ -487,34 +302,6 @@ func (q *Queue) Push(t *Task) {
 
 无锁优化：单核通过中断禁用，多核用 `atomicsLock` 自旋锁。
 
-## 性能数据
-
-### 微基准测试 (Cortex-M4 168MHz)
-
-| 操作 | 延迟 | 对比 |
-|-----|------|------|
-| Goroutine 创建 | 6 μs | FreeRTOS: 15 μs |
-| 上下文切换 | 2 μs (336 cycles) | Linux thread: 1-3 μs |
-| Channel 往返 | 12 μs | - |
-
-### 内存占用
-
-- 每个 goroutine: 固定栈大小（典型 2KB）
-- Task 结构体: 64B (amd64)
-- 无动态增长，无栈池
-
-### 瓶颈分析
-
-创建开销拆解：
-- 堆分配栈: ~4 μs (67%)
-- 初始化结构: ~1 μs (17%)
-- 加入队列: ~1 μs (16%)
-
-切换开销拆解：
-- 寄存器保存/恢复: 36 cycles (60%)
-- 栈切换: 6 cycles (10%)
-- Cache/TLB miss: ~18 cycles (30%)
-
 ## 与标准 Go 差异
 
 | 特性 | 标准 Go | TinyGo |
@@ -531,21 +318,6 @@ func (q *Queue) Push(t *Task) {
 - 放弃抢占 → 简化运行时，但需程序员自律
 - 固定调度策略 → 减小二进制体积
 
-## 编译选项
-
-```bash
-# 默认栈大小
-tinygo build -stack-size=2048
-
-# 自动栈大小分析
-tinygo build -opt=2  # 启用栈分析 pass
-
-# 调度器选择
--scheduler=none      # 无调度器，go 直接调用
--scheduler=tasks     # 协作式单核
--scheduler=asyncify  # WASM asyncify
--scheduler=cores     # 多核
-```
 
 ## 栈溢出检测机制
 
@@ -562,35 +334,5 @@ func (s *state) resume() {
 ```
 
 Canary 值选择：随机数，避免被意外数据匹配。
-
-## 总结
-
-TinyGo 的 goroutine 实现是对标准 Go 的极简化改造：
-
-**保留的抽象**：
-- go 关键字和语法
-- Channel、select 等并发原语
-- 调度透明性
-
-**移除的特性**：
-- 动态栈增长
-- 抢占式调度（tasks）
-- 栈池复用
-- G-M-P 模型
-
-**适用场景**：
-- RAM < 1MB
-- 需要确定性延迟
-- 裸机或 RTOS 环境
-- 不适合计算密集型长任务
-
-核心思想：将复杂性从运行时转移到编译时 + 程序员约束。
-
----
-
-**源码版本**: TinyGo 0.38.0
-**关键文件**:
-- `compiler/goroutine.go`
-- `src/internal/task/task_stack.go`
-- `src/internal/task/task_stack_amd64.S`
+d64.S`
 - `src/runtime/scheduler_cooperative.go`
